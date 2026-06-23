@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Business Intelligence Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
+
+  <!-- 1. React + ReactDOM FIRST -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+
+  <!-- 2. PropTypes (Recharts needs this) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+
+  <!-- 3. Recharts UMD from unpkg (correctly exposes window.Recharts) -->
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+
+  <!-- 4. Babel standalone (AFTER all libs so they're available as globals) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+  <!-- 5. SheetJS + PapaParse -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0B0F1A; font-family: 'Inter', system-ui, sans-serif; color: #F1F5F9; }
+    @keyframes spin  { to { transform: rotate(360deg); } }
+    @keyframes pulse { 0%,100%{opacity:.7;transform:scale(1)} 50%{opacity:1;transform:scale(1.1)} }
+    input, button, select { font-family: inherit; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #111827; }
+    ::-webkit-scrollbar-thumb { background: #1E2A3A; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // ── Pull from globals set by UMD scripts above ──────────────
+    const { useState, useCallback, useRef } = React;
+
+    const {
+      LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
+      AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
+      Legend, ResponsiveContainer, ComposedChart
+    } = window.Recharts;
+
+    // ── Design tokens ───────────────────────────────────────────
+    const C = {
+      bg:      "#0B0F1A",
+      panel:   "#111827",
+      panel2:  "#161E2E",
+      border:  "#1E2A3A",
+      accent:  "#00D4FF",
+      accent2: "#7C3AED",
+      green:   "#10B981",
+      red:     "#EF4444",
+      amber:   "#F59E0B",
+      text:    "#F1F5F9",
+      muted:   "#64748B",
+      muted2:  "#94A3B8",
+    };
+
+    const CHART_COLORS = ["#00D4FF","#7C3AED","#10B981","#F59E0B","#EF4444","#EC4899","#14B8A6","#F97316"];
+
+    // ── API helper ──────────────────────────────────────────────
+    function callClaude(systemPrompt, userMessage) {
+      return fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1500,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userMessage }],
+        }),
+      })
+        .then(r => r.json())
+        .then(d => d.content?.map(b => b.text || "").join("") || "");
+    }
+
+    // ── Utilities ───────────────────────────────────────────────
+    function parseJSON(raw) {
+      try {
+        const clean = raw.replace(/```json[\s\S]*?```|```[\s\S]*?```/g, m =>
+          m.replace(/```json\n?|```\n?/g, "")
+        ).trim();
+        return JSON.parse(clean);
+      } catch {
+        const m = raw.match(/\{[\s\S]*\}/);
+        try { return m ? JSON.parse(m[0]) : null; } catch { return null; }
+      }
+    }
+
+    function fmt(n, type = "number") {
+      if (n == null || isNaN(n)) return "—";
+      if (type === "percent")  return n.toFixed(1) + "%";
+      if (type === "currency") {
+        if (Math.abs(n) >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M";
+        if (Math.abs(n) >= 1e3) return "$" + (n / 1e3).toFixed(1) + "K";
+        return "$" + n.toLocaleString();
+      }
+      if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + "M";
+      if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "K";
+      return n.toLocaleString();
+    }
+
+    function truncate(str, max = 18) {
+      return str && str.length > max ? str.slice(0, max) + "…" : str;
+    }
+
+    // ── Sub-components ──────────────────────────────────────────
+    function Spinner({ text = "Processing…" }) {
+      return (
+        <div style={{ display:"flex", alignItems:"center", gap:8, color: C.accent, fontSize:13 }}>
+          <div style={{
+            width:16, height:16, border:`2px solid ${C.border}`,
+            borderTop:`2px solid ${C.accent}`, borderRadius:"50%",
+            animation:"spin 0.8s linear infinite", flexShrink:0
+          }} />
+          {text}
+        </div>
+      );
+    }
+
+    function KPICard({ label, value, change, color, icon }) {
+      const up = change >= 0;
+      return (
+        <div style={{
+          background: C.panel, border:`1px solid ${C.border}`,
+          borderRadius:12, padding:"18px 20px", flex:1, minWidth:150,
+          position:"relative", overflow:"hidden"
+        }}>
+          <div style={{ position:"absolute", top:12, right:14, fontSize:22, opacity:0.12 }}>{icon}</div>
+          <div style={{ fontSize:10, color: C.muted, textTransform:"uppercase", letterSpacing:1.5, fontWeight:600 }}>{label}</div>
+          <div style={{ fontSize:26, fontWeight:800, color: color || C.text, marginTop:6, lineHeight:1 }}>{value}</div>
+          {change != null && (
+            <div style={{ fontSize:12, color: up ? C.green : C.red, marginTop:6, display:"flex", alignItems:"center", gap:4 }}>
+              <span style={{ fontSize:10 }}>{up ? "▲" : "▼"}</span>
+              {Math.abs(change).toFixed(1)}% vs prev period
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function InsightCard({ icon, title, body, priority }) {
+      const pColor = priority === "High" ? C.red : priority === "Medium" ? C.amber : C.green;
+      return (
+        <div style={{
+          background: C.panel, border:`1px solid ${C.border}`,
+          borderLeft:`3px solid ${pColor}`,
+          borderRadius:10, padding:"14px 18px", marginBottom:10
+        }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
+            <div style={{ fontSize:14, fontWeight:600, color: C.text, display:"flex", alignItems:"center", gap:8 }}>
+              <span>{icon}</span>{title}
+            </div>
+            {priority && (
+              <span style={{
+                fontSize:10, fontWeight:700, color: pColor,
+                border:`1px solid ${pColor}`, borderRadius:20, flexShrink:0,
+                padding:"2px 8px", textTransform:"uppercase", letterSpacing:1
+              }}>{priority}</span>
+            )}
+          </div>
+          <div style={{ fontSize:13, color: C.muted2, marginTop:8, lineHeight:1.65 }}>{body}</div>
+        </div>
+      );
+    }
+
+    function RecommendationCard({ icon, title, body, priority, team, impact }) {
+      const pColor = priority === "High" ? C.red : priority === "Medium" ? C.amber : C.green;
+      return (
+        <div style={{
+          background: C.panel2, border:`1px solid ${C.border}`,
+          borderRadius:10, padding:"16px 18px", marginBottom:10
+        }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8, marginBottom:8 }}>
+            <div style={{ fontSize:14, fontWeight:600, color: C.text, display:"flex", alignItems:"center", gap:8 }}>
+              <span>{icon}</span>{title}
+            </div>
+            <span style={{
+              fontSize:10, fontWeight:700, color: pColor,
+              border:`1px solid ${pColor}`, borderRadius:20, flexShrink:0,
+              padding:"2px 8px", textTransform:"uppercase", letterSpacing:1
+            }}>{priority}</span>
+          </div>
+          <div style={{ fontSize:13, color: C.muted2, lineHeight:1.65, marginBottom:10 }}>{body}</div>
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+            {team && (
+              <span style={{ fontSize:11, background:"rgba(0,212,255,0.08)", color: C.accent,
+                borderRadius:6, padding:"3px 10px", border:`1px solid rgba(0,212,255,0.2)` }}>
+                👥 {team}
+              </span>
+            )}
+            {impact && (
+              <span style={{ fontSize:11, background:"rgba(16,185,129,0.08)", color: C.green,
+                borderRadius:6, padding:"3px 10px", border:`1px solid rgba(16,185,129,0.2)` }}>
+                📈 {impact}
+              </span>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function Tab({ label, active, onClick }) {
+      return (
+        <button onClick={onClick} style={{
+          background: active ? C.accent : "transparent",
+          color: active ? C.bg : C.muted,
+          border:`1px solid ${active ? C.accent : C.border}`,
+          borderRadius:8, padding:"7px 16px",
+          fontSize:13, fontWeight:600, cursor:"pointer", transition:"all .2s",
+          whiteSpace:"nowrap"
+        }}>{label}</button>
+      );
+    }
+
+    function SectionHeader({ title, subtitle }) {
+      return (
+        <div style={{ marginBottom:16 }}>
+          <div style={{
+            fontSize:10, fontWeight:700, color: C.accent,
+            textTransform:"uppercase", letterSpacing:2,
+            borderBottom:`1px solid ${C.border}`, paddingBottom:8, marginBottom: subtitle ? 6 : 0
+          }}>{title}</div>
+          {subtitle && <div style={{ fontSize:12, color: C.muted }}>{subtitle}</div>}
+        </div>
+      );
+    }
+
+    function DataTable({ rows, columns }) {
+      const [page, setPage]       = useState(0);
+      const [sortCol, setSortCol] = useState(null);
+      const [sortDir, setSortDir] = useState("asc");
+      const [search, setSearch]   = useState("");
+      const perPage = 12;
+
+      const filtered = rows.filter(r =>
+        !search || Object.values(r).some(v => String(v).toLowerCase().includes(search.toLowerCase()))
+      );
+      const sorted = sortCol
+        ? [...filtered].sort((a, b) => {
+            const va = a[sortCol], vb = b[sortCol];
+            const n = parseFloat(va), m = parseFloat(vb);
+            const cmp = !isNaN(n) && !isNaN(m) ? n - m : String(va).localeCompare(String(vb));
+            return sortDir === "asc" ? cmp : -cmp;
+          })
+        : filtered;
+      const paged      = sorted.slice(page * perPage, (page + 1) * perPage);
+      const totalPages = Math.ceil(sorted.length / perPage) || 1;
+
+      const handleSort = col => {
+        if (sortCol === col) setSortDir(d => d === "asc" ? "desc" : "asc");
+        else { setSortCol(col); setSortDir("asc"); }
+        setPage(0);
+      };
+
+      return (
+        <div>
+          <div style={{ marginBottom:12, display:"flex", gap:10, alignItems:"center" }}>
+            <input
+              value={search}
+              onChange={e => { setSearch(e.target.value); setPage(0); }}
+              placeholder="Search rows…"
+              style={{
+                background: C.panel, border:`1px solid ${C.border}`, borderRadius:8,
+                color: C.text, padding:"7px 12px", fontSize:13, width:220, outline:"none"
+              }}
+            />
+            <div style={{ fontSize:12, color: C.muted, marginLeft:"auto" }}>
+              {sorted.length} rows · page {page + 1}/{totalPages}
+            </div>
+          </div>
+          <div style={{ overflowX:"auto", borderRadius:10, border:`1px solid ${C.border}` }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+              <thead>
+                <tr style={{ background: C.panel2 }}>
+                  {columns.map(col => (
+                    <th key={col} onClick={() => handleSort(col)} style={{
+                      padding:"10px 14px", textAlign:"left", color: C.muted,
+                      fontWeight:600, textTransform:"uppercase", letterSpacing:0.8,
+                      fontSize:10, cursor:"pointer", userSelect:"none", whiteSpace:"nowrap",
+                      borderBottom:`1px solid ${C.border}`
+                    }}>
+                      {col} {sortCol === col ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {paged.map((row, i) => (
+                  <tr key={i} style={{ borderTop:`1px solid ${C.border}`,
+                    background: i % 2 === 0 ? "transparent" : "rgba(255,255,255,0.01)" }}>
+                    {columns.map(col => (
+                      <td key={col} style={{ padding:"9px 14px", color: C.muted2, maxWidth:180,
+                        overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                        {String(row[col] ?? "—")}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display:"flex", gap:8, marginTop:12, justifyContent:"center" }}>
+            <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}
+              style={{ background: C.panel, border:`1px solid ${C.border}`,
+                color: page === 0 ? C.muted : C.text, borderRadius:7,
+                padding:"5px 14px", cursor: page === 0 ? "default" : "pointer", fontSize:12 }}>
+              ← Prev
+            </button>
+            <button onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1}
+              style={{ background: C.panel, border:`1px solid ${C.border}`,
+                color: page >= totalPages - 1 ? C.muted : C.text, borderRadius:7,
+                padding:"5px 14px", cursor: page >= totalPages - 1 ? "default" : "pointer", fontSize:12 }}>
+              Next →
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Main App ────────────────────────────────────────────────
+    function App() {
+      const [stage,       setStage]       = useState("upload");
+      const [tab,         setTab]         = useState("overview");
+      const [fileName,    setFileName]    = useState("");
+      const [loadingStep, setLoadingStep] = useState("");
+      const [loadingPct,  setLoadingPct]  = useState(0);
+      const [dashboard,   setDashboard]   = useState(null);
+      const [question,    setQuestion]    = useState("");
+      const [chatHistory, setChatHistory] = useState([]);
+      const [askLoading,  setAskLoading]  = useState(false);
+      const [dragOver,    setDragOver]    = useState(false);
+      const rawDataRef = useRef(null);
+      const fileRef    = useRef();
+      const chatEndRef = useRef();
+
+      const steps = [
+        "Detecting data structure and KPIs…",
+        "Building charts and visualizations…",
+        "Generating AI insights and recommendations…",
+        "Running forecasting engine…",
+      ];
+
+      // ── File ingestion ────────────────────────────────────────
+      const handleFile = useCallback(async (file) => {
+        if (!file) return;
+        setFileName(file.name);
+        setStage("loading");
+        setChatHistory([]);
+        setTab("overview");
+
+        let rows = [];
+        try {
+          if (file.name.match(/\.csv$/i)) {
+            const text   = await file.text();
+            const parsed = Papa.parse(text, { header:true, skipEmptyLines:true, dynamicTyping:true });
+            rows = parsed.data;
+          } else {
+            const buf = await file.arrayBuffer();
+            const wb  = XLSX.read(buf);
+            const ws  = wb.Sheets[wb.SheetNames[0]];
+            rows = XLSX.utils.sheet_to_json(ws, { defval:"" });
+          }
+        } catch (e) {
+          alert("Could not read file: " + e.message);
+          setStage("upload");
+          return;
+        }
+
+        rawDataRef.current = rows;
+        const preview = JSON.stringify(rows.slice(0, 100));
+        const SYSTEM  = "You are an elite business intelligence AI. Return ONLY valid JSON, no markdown fences, no preamble.";
+
+        const advance = (i) => {
+          setLoadingStep(steps[i]);
+          setLoadingPct(Math.round(((i + 1) / steps.length) * 100));
+        };
+
+        advance(0);
+        const structureRaw = await callClaude(SYSTEM, `
+Analyze this dataset and return JSON with EXACTLY this shape:
+{
+  "columns": ["col1","col2"],
+  "numericCols": ["col1"],
+  "categoryCols": ["col1"],
+  "dateCols": ["col1"],
+  "rowCount": 123,
+  "dataHealthScore": 87,
+  "dataHealthNotes": "brief note",
+  "kpis": [
+    {"label":"Total Revenue","value":123456,"change":12.3,"type":"currency","icon":"💰"},
+    {"label":"Total Orders","value":4500,"change":-2.1,"type":"number","icon":"📦"},
+    {"label":"Avg Order Value","value":274,"change":5.0,"type":"currency","icon":"🛒"},
+    {"label":"Growth Rate","value":14.2,"change":null,"type":"percent","icon":"📈"}
+  ],
+  "executiveSummary": "2-3 sentence business summary with key findings"
+}
+Data (up to 100 rows): ${preview}`);
+        const structure = parseJSON(structureRaw) || { kpis:[], columns:[], rowCount:rows.length, dataHealthScore:70, dataHealthNotes:"" };
+
+        advance(1);
+        const chartsRaw = await callClaude(SYSTEM, `
+Generate 5 chart configurations from this data. Return JSON:
+{
+  "charts": [
+    {"id":"c1","type":"bar","title":"Revenue by Category","data":[{"name":"Electronics","value":45000}]},
+    {"id":"c2","type":"line","title":"Monthly Trend","data":[{"name":"Jan","value":12000}]},
+    {"id":"c3","type":"pie","title":"Sales Mix","data":[{"name":"Product A","value":40}]},
+    {"id":"c4","type":"area","title":"Cumulative Growth","data":[{"name":"Q1","value":30000}]},
+    {"id":"c5","type":"bar","title":"Top 10 Items","data":[{"name":"Item A","value":5000}]}
+  ]
+}
+Use real aggregated values. Each chart must have at least 4 data points. Data: ${preview}`);
+        const chartsObj = parseJSON(chartsRaw) || { charts:[] };
+
+        advance(2);
+        const insightsRaw = await callClaude(SYSTEM, `
+Analyze this business data. Return JSON:
+{
+  "findings": [{"icon":"📈","title":"Finding","body":"Detail with numbers","priority":"High"}],
+  "recommendations": [{"icon":"🎯","title":"Action","body":"Step","priority":"High","team":"Sales","impact":"Metric"}],
+  "alerts": [{"severity":"critical","message":"Alert with numbers"}]
+}
+Generate 6 findings, 6 recommendations, 3 alerts. Data: ${preview}`);
+        const insights = parseJSON(insightsRaw) || { findings:[], recommendations:[], alerts:[] };
+
+        advance(3);
+        const forecastRaw = await callClaude(SYSTEM, `
+Generate a business forecast. Return JSON:
+{
+  "forecast": [
+    {"period":"Next Month","value":52000,"confidence":88,"change":8.3},
+    {"period":"Next Quarter","value":165000,"confidence":80,"change":12.1},
+    {"period":"Next 6 Months","value":340000,"confidence":71,"change":18.4},
+    {"period":"Next 12 Months","value":720000,"confidence":60,"change":24.7}
+  ],
+  "bestCase": {"multiplier":1.25,"label":"Optimistic","description":"Scenario description"},
+  "worstCase": {"multiplier":0.78,"label":"Conservative","description":"Scenario description"},
+  "forecastTrend": [
+    {"name":"Jan","actual":12000},{"name":"Feb","actual":15000},
+    {"name":"Mar","actual":14500},{"name":"Apr","projected":17000},
+    {"name":"May","projected":19500},{"name":"Jun","projected":22000}
+  ],
+  "forecastSummary": "2-3 sentences on growth trajectory"
+}
+Data: ${preview}`);
+        const forecastObj = parseJSON(forecastRaw) || {};
+
+        setDashboard({
+          structure,
+          charts:          chartsObj.charts || [],
+          findings:        insights.findings || [],
+          recommendations: insights.recommendations || [],
+          alerts:          insights.alerts || [],
+          forecast:        forecastObj.forecast || [],
+          bestCase:        forecastObj.bestCase,
+          worstCase:       forecastObj.worstCase,
+          forecastTrend:   forecastObj.forecastTrend || [],
+          forecastSummary: forecastObj.forecastSummary || "",
+          rows,
+        });
+        setStage("dashboard");
+      }, []);
+
+      // ── Chat with data ────────────────────────────────────────
+      const handleAsk = async () => {
+        if (!question.trim() || !rawDataRef.current) return;
+        const q = question.trim();
+        setQuestion("");
+        const newHistory = [...chatHistory, { role:"user", content: q }];
+        setChatHistory(newHistory);
+        setAskLoading(true);
+        setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior:"smooth" }), 50);
+
+        const preview        = JSON.stringify(rawDataRef.current.slice(0, 80));
+        const contextMessages = newHistory.map(m => ({ role: m.role, content: m.content }));
+        if (contextMessages.length === 1) {
+          contextMessages[0].content = `Dataset sample (first 80 rows):\n${preview}\n\nQuestion: ${q}`;
+        }
+
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            max_tokens: 1000,
+            system: "You are a sharp business data analyst. Be concise, use bullet points for multi-part answers.",
+            messages: contextMessages,
+          }),
+        }).then(r => r.json()).then(d => d.content?.map(b => b.text || "").join("") || "");
+
+        setChatHistory([...newHistory, { role:"assistant", content: res }]);
+        setAskLoading(false);
+        setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior:"smooth" }), 50);
+      };
+
+      // ── Chart renderer ────────────────────────────────────────
+      function renderChart(chart) {
+        const h            = 230;
+        const tooltipStyle = { background: C.panel, border:`1px solid ${C.border}`, borderRadius:8, fontSize:12 };
+        const tickStyle    = { fill: C.muted, fontSize:11 };
+        const gridStyle    = { strokeDasharray:"3 3", stroke: C.border };
+
+        if (chart.type === "bar") return (
+          <ResponsiveContainer width="100%" height={h}>
+            <BarChart data={chart.data} margin={{ top:5, right:10, left:0, bottom:5 }}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="name" tick={tickStyle} tickFormatter={v => truncate(v, 12)} />
+              <YAxis tick={tickStyle} width={50} />
+              <Tooltip contentStyle={tooltipStyle} />
+              <Bar dataKey="value" radius={[4,4,0,0]}>
+                {chart.data.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        );
+        if (chart.type === "line") return (
+          <ResponsiveContainer width="100%" height={h}>
+            <LineChart data={chart.data} margin={{ top:5, right:10, left:0, bottom:5 }}>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="name" tick={tickStyle} tickFormatter={v => truncate(v, 10)} />
+              <YAxis tick={tickStyle} width={50} />
+              <Tooltip contentStyle={tooltipStyle} />
+              <Line type="monotone" dataKey="value" stroke={C.accent} strokeWidth={2.5} dot={{ fill:C.accent, r:3 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        );
+        if (chart.type === "pie") return (
+          <ResponsiveContainer width="100%" height={h}>
+            <PieChart>
+              <Pie data={chart.data} dataKey="value" nameKey="name"
+                cx="50%" cy="50%" outerRadius={85} innerRadius={30}
+                label={({ name, percent }) => percent > 0.05 ? `${truncate(name,10)} ${(percent*100).toFixed(0)}%` : ""}
+                labelLine={false}>
+                {chart.data.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+              </Pie>
+              <Tooltip contentStyle={tooltipStyle} />
+              <Legend iconSize={10} wrapperStyle={{ fontSize:11, color: C.muted }} />
+            </PieChart>
+          </ResponsiveContainer>
+        );
+        if (chart.type === "area") return (
+          <ResponsiveContainer width="100%" height={h}>
+            <AreaChart data={chart.data} margin={{ top:5, right:10, left:0, bottom:5 }}>
+              <defs>
+                <linearGradient id={`ag_${chart.id}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor={C.accent} stopOpacity={0.25} />
+                  <stop offset="95%" stopColor={C.accent} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...gridStyle} />
+              <XAxis dataKey="name" tick={tickStyle} tickFormatter={v => truncate(v, 10)} />
+              <YAxis tick={tickStyle} width={50} />
+              <Tooltip contentStyle={tooltipStyle} />
+              <Area type="monotone" dataKey="value" stroke={C.accent}
+                fill={`url(#ag_${chart.id})`} strokeWidth={2.5} />
+            </AreaChart>
+          </ResponsiveContainer>
+        );
+        return null;
+      }
+
+      // ── Upload screen ─────────────────────────────────────────
+      if (stage === "upload") return (
+        <div style={{ minHeight:"100vh", background:C.bg, display:"flex",
+          flexDirection:"column", alignItems:"center", justifyContent:"center",
+          color:C.text, padding:24 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:20 }}>
+            <div style={{
+              width:36, height:36, borderRadius:10,
+              background:`linear-gradient(135deg, ${C.accent}, ${C.accent2})`,
+              display:"flex", alignItems:"center", justifyContent:"center", fontSize:18
+            }}>⚡</div>
+            <div style={{ fontSize:10, letterSpacing:4, color:C.accent, textTransform:"uppercase", fontWeight:700 }}>
+              AI Business Intelligence
+            </div>
+          </div>
+          <h1 style={{ fontSize:44, fontWeight:900, textAlign:"center", margin:0, lineHeight:1.1, maxWidth:600 }}>
+            Your Data.<br />
+            <span style={{ background:`linear-gradient(90deg, ${C.accent}, ${C.accent2})`,
+              WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>
+              Instant Intelligence.
+            </span>
+          </h1>
+          <p style={{ color:C.muted2, marginTop:16, fontSize:15, textAlign:"center", maxWidth:480, lineHeight:1.7 }}>
+            Upload any Excel or CSV file. Claude analyzes it, builds an executive dashboard,
+            forecasts trends, and delivers actionable recommendations — instantly.
+          </p>
+
+          <div
+            onClick={() => fileRef.current?.click()}
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={e => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); }}
+            style={{
+              marginTop:36, border:`2px dashed ${dragOver ? C.accent : C.border}`,
+              borderRadius:18, padding:"48px 64px", cursor:"pointer", textAlign:"center",
+              transition:"all .2s",
+              background: dragOver ? "rgba(0,212,255,0.06)" : "rgba(0,212,255,0.02)",
+              transform: dragOver ? "scale(1.01)" : "scale(1)"
+            }}>
+            <div style={{ fontSize:44 }}>📊</div>
+            <div style={{ fontSize:17, fontWeight:700, marginTop:12 }}>
+              {dragOver ? "Release to analyze" : "Drop your file here"}
+            </div>
+            <div style={{ fontSize:13, color:C.muted, marginTop:6 }}>Excel (.xlsx, .xls) or CSV files</div>
+            <div style={{
+              marginTop:20, background:`linear-gradient(90deg, ${C.accent}, ${C.accent2})`,
+              color:"#fff", borderRadius:9, padding:"10px 28px",
+              fontWeight:700, fontSize:13, display:"inline-block"
+            }}>Browse File</div>
+          </div>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display:"none" }}
+            onChange={e => handleFile(e.target.files[0])} />
+
+          <div style={{ display:"flex", gap:24, marginTop:44, flexWrap:"wrap", justifyContent:"center" }}>
+            {[["🔍","Auto-detect KPIs"],["📈","AI Forecasts"],["💡","Smart Insights"],["❓","Chat with Data"],["📋","Browse Records"]].map(([icon,label]) => (
+              <div key={label} style={{
+                display:"flex", alignItems:"center", gap:8, fontSize:13, color:C.muted,
+                background:C.panel, border:`1px solid ${C.border}`, borderRadius:8, padding:"8px 14px"
+              }}><span>{icon}</span>{label}</div>
+            ))}
+          </div>
+        </div>
+      );
+
+      // ── Loading screen ────────────────────────────────────────
+      if (stage === "loading") return (
+        <div style={{ minHeight:"100vh", background:C.bg, display:"flex",
+          flexDirection:"column", alignItems:"center", justifyContent:"center",
+          color:C.text, padding:24 }}>
+          <div style={{ fontSize:44, marginBottom:20, animation:"pulse 1.5s ease-in-out infinite" }}>⚡</div>
+          <h2 style={{ fontSize:24, fontWeight:700, textAlign:"center", maxWidth:400 }}>
+            Analyzing "{fileName}"
+          </h2>
+          <p style={{ color:C.muted2, marginTop:8, fontSize:14 }}>{loadingStep}</p>
+          <div style={{ marginTop:28, width:360, maxWidth:"90vw" }}>
+            <div style={{ height:6, background:C.border, borderRadius:8, overflow:"hidden" }}>
+              <div style={{
+                height:"100%", background:`linear-gradient(90deg, ${C.accent}, ${C.accent2})`,
+                borderRadius:8, width:`${loadingPct}%`, transition:"width 0.5s ease"
+              }} />
+            </div>
+            <div style={{ marginTop:6, fontSize:11, color:C.muted, textAlign:"right" }}>{loadingPct}%</div>
+          </div>
+          <div style={{ marginTop:36, display:"flex", flexDirection:"column", gap:10 }}>
+            {steps.map((s, i) => (
+              <div key={i} style={{
+                display:"flex", alignItems:"center", gap:10, fontSize:13,
+                color: loadingStep===s ? C.accent : (steps.indexOf(loadingStep) > i ? C.green : C.muted)
+              }}>
+                <span style={{ fontSize:12 }}>
+                  {steps.indexOf(loadingStep) > i ? "✓" : loadingStep===s ? "⟳" : "○"}
+                </span>
+                {s}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+
+      // ── Dashboard ─────────────────────────────────────────────
+      const { structure, charts, findings, recommendations, alerts,
+              forecast, bestCase, worstCase, forecastTrend, forecastSummary, rows } = dashboard;
+
+      return (
+        <div style={{ minHeight:"100vh", background:C.bg, color:C.text }}>
+
+          {/* Header */}
+          <div style={{
+            background:C.panel, borderBottom:`1px solid ${C.border}`,
+            padding:"12px 28px", display:"flex", alignItems:"center",
+            justifyContent:"space-between", flexWrap:"wrap", gap:10,
+            position:"sticky", top:0, zIndex:50
+          }}>
+            <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+              <div style={{
+                width:32, height:32, borderRadius:8,
+                background:`linear-gradient(135deg, ${C.accent}, ${C.accent2})`,
+                display:"flex", alignItems:"center", justifyContent:"center", fontSize:15, flexShrink:0
+              }}>⚡</div>
+              <div>
+                <div style={{ fontSize:10, color:C.accent, letterSpacing:3, textTransform:"uppercase", fontWeight:700 }}>AI Dashboard</div>
+                <div style={{ fontSize:16, fontWeight:700, lineHeight:1.2 }}>{fileName}</div>
+              </div>
+              <div style={{
+                fontSize:11, color:C.muted, background:C.panel2,
+                border:`1px solid ${C.border}`, borderRadius:6, padding:"3px 10px", marginLeft:4
+              }}>
+                {(structure.rowCount || rows.length).toLocaleString()} rows · {structure.dataHealthScore}/100 health
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {["overview","insights","forecast","data","ask"].map(t => (
+                <Tab key={t} label={t==="ask" ? "💬 Ask" : t.charAt(0).toUpperCase()+t.slice(1)}
+                  active={tab===t} onClick={() => setTab(t)} />
+              ))}
+              <button onClick={() => { setStage("upload"); setDashboard(null); }} style={{
+                background:"transparent", border:`1px solid ${C.border}`, color:C.muted,
+                borderRadius:8, padding:"7px 12px", cursor:"pointer", fontSize:12, marginLeft:4
+              }}>↑ New File</button>
+            </div>
+          </div>
+
+          {/* Alerts */}
+          {alerts?.length > 0 && (
+            <div style={{ padding:"10px 28px", display:"flex", gap:8, flexWrap:"wrap", borderBottom:`1px solid ${C.border}` }}>
+              {alerts.map((a, i) => (
+                <div key={i} style={{
+                  background: a.severity==="critical" ? "rgba(239,68,68,0.08)" : "rgba(245,158,11,0.08)",
+                  border:`1px solid ${a.severity==="critical" ? C.red : C.amber}`,
+                  borderRadius:8, padding:"7px 14px", fontSize:12,
+                  color: a.severity==="critical" ? C.red : C.amber,
+                  display:"flex", alignItems:"center", gap:6
+                }}>
+                  {a.severity==="critical" ? "🚨" : "⚠️"} {a.message}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ padding:"24px 28px 48px" }}>
+
+            {/* OVERVIEW */}
+            {tab === "overview" && (
+              <>
+                <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:24 }}>
+                  {(structure.kpis || []).map((kpi, i) => (
+                    <KPICard key={i} label={kpi.label} value={fmt(kpi.value, kpi.type)}
+                      change={kpi.change} icon={kpi.icon || "📊"} color={i===0 ? C.accent : undefined} />
+                  ))}
+                </div>
+                {structure.executiveSummary && (
+                  <div style={{
+                    background:`linear-gradient(135deg, rgba(0,212,255,0.05), rgba(124,58,237,0.05))`,
+                    border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 22px", marginBottom:24
+                  }}>
+                    <div style={{ fontSize:10, color:C.accent, fontWeight:700, letterSpacing:2, textTransform:"uppercase", marginBottom:8 }}>
+                      Executive Summary
+                    </div>
+                    <div style={{ fontSize:14, color:C.muted2, lineHeight:1.75 }}>{structure.executiveSummary}</div>
+                  </div>
+                )}
+                <SectionHeader title="Visualizations" subtitle={`${charts.length} charts generated`} />
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(340px, 1fr))", gap:16 }}>
+                  {charts.map(chart => (
+                    <div key={chart.id} style={{ background:C.panel, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 20px" }}>
+                      <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:14 }}>{chart.title}</div>
+                      {renderChart(chart)}
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginTop:24, background:C.panel, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 22px" }}>
+                  <SectionHeader title="Data Quality Report" />
+                  <div style={{ display:"flex", gap:16, alignItems:"center", flexWrap:"wrap" }}>
+                    <div style={{ textAlign:"center" }}>
+                      <div style={{
+                        fontSize:36, fontWeight:900,
+                        color: structure.dataHealthScore>=80 ? C.green : structure.dataHealthScore>=60 ? C.amber : C.red
+                      }}>{structure.dataHealthScore}</div>
+                      <div style={{ fontSize:11, color:C.muted }}>/ 100</div>
+                    </div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:13, color:C.muted2, lineHeight:1.65 }}>{structure.dataHealthNotes}</div>
+                      <div style={{ display:"flex", gap:10, marginTop:10, flexWrap:"wrap" }}>
+                        {[["Numeric",structure.numericCols?.length],["Category",structure.categoryCols?.length],["Date",structure.dateCols?.length]]
+                          .map(([lbl,val]) => val > 0 && (
+                            <div key={lbl} style={{ fontSize:11, background:C.panel2, border:`1px solid ${C.border}`, borderRadius:6, padding:"3px 10px", color:C.muted2 }}>
+                              {lbl}: {val}
+                            </div>
+                          ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {/* INSIGHTS */}
+            {tab === "insights" && (
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:28 }}>
+                <div>
+                  <SectionHeader title="Key Findings" subtitle={`${findings.length} insights`} />
+                  {findings.length > 0
+                    ? findings.map((f, i) => <InsightCard key={i} {...f} />)
+                    : <div style={{ color:C.muted, fontSize:13 }}>No findings generated.</div>}
+                </div>
+                <div>
+                  <SectionHeader title="Recommendations" subtitle={`${recommendations.length} actions`} />
+                  {recommendations.length > 0
+                    ? recommendations.map((r, i) => <RecommendationCard key={i} {...r} />)
+                    : <div style={{ color:C.muted, fontSize:13 }}>No recommendations generated.</div>}
+                </div>
+              </div>
+            )}
+
+            {/* FORECAST */}
+            {tab === "forecast" && (
+              <>
+                {forecastSummary && (
+                  <div style={{
+                    background:`linear-gradient(135deg, rgba(0,212,255,0.05), rgba(124,58,237,0.05))`,
+                    border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 22px", marginBottom:24
+                  }}>
+                    <div style={{ fontSize:10, color:C.accent, fontWeight:700, letterSpacing:2, textTransform:"uppercase", marginBottom:8 }}>
+                      Forecast Summary
+                    </div>
+                    <div style={{ fontSize:14, color:C.muted2, lineHeight:1.75 }}>{forecastSummary}</div>
+                  </div>
+                )}
+                <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:24 }}>
+                  {forecast.map((f, i) => (
+                    <div key={i} style={{ background:C.panel, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 20px", flex:1, minWidth:150 }}>
+                      <div style={{ fontSize:10, color:C.muted, textTransform:"uppercase", letterSpacing:1.5, fontWeight:600 }}>{f.period}</div>
+                      <div style={{ fontSize:26, fontWeight:800, color:C.accent, marginTop:6 }}>{fmt(f.value, "currency")}</div>
+                      <div style={{ display:"flex", gap:10, marginTop:8, alignItems:"center" }}>
+                        <div style={{ fontSize:12, color: f.change>=0 ? C.green : C.red }}>
+                          {f.change>=0 ? "▲" : "▼"} {Math.abs(f.change).toFixed(1)}%
+                        </div>
+                        <div style={{ fontSize:11, color:C.muted }}>{f.confidence}% confidence</div>
+                      </div>
+                      <div style={{ marginTop:8, height:4, background:C.border, borderRadius:4 }}>
+                        <div style={{ height:"100%", borderRadius:4, width:`${f.confidence}%`,
+                          background:`linear-gradient(90deg, ${C.accent}, ${C.accent2})` }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {forecastTrend.length > 0 && (
+                  <div style={{ background:C.panel, border:`1px solid ${C.border}`, borderRadius:12, padding:"20px 22px", marginBottom:20 }}>
+                    <SectionHeader title="Actual vs Projected Trend" />
+                    <ResponsiveContainer width="100%" height={260}>
+                      <ComposedChart data={forecastTrend} margin={{ top:5, right:15, left:0, bottom:5 }}>
+                        <defs>
+                          <linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%"  stopColor={C.accent2} stopOpacity={0.25} />
+                            <stop offset="95%" stopColor={C.accent2} stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                        <XAxis dataKey="name" tick={{ fill:C.muted, fontSize:11 }} />
+                        <YAxis tick={{ fill:C.muted, fontSize:11 }} width={55} />
+                        <Tooltip contentStyle={{ background:C.panel, border:`1px solid ${C.border}`, borderRadius:8, fontSize:12 }} />
+                        <Legend wrapperStyle={{ fontSize:12, color:C.muted }} />
+                        <Bar dataKey="actual" fill={C.green} radius={[3,3,0,0]} name="Actual" fillOpacity={0.85} />
+                        <Area type="monotone" dataKey="projected" stroke={C.accent2} fill="url(#projGrad)"
+                          strokeWidth={2.5} strokeDasharray="5 3" name="Projected" />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+                {(bestCase || worstCase) && (
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
+                    {bestCase && (
+                      <div style={{ background:"rgba(16,185,129,0.07)", border:`1px solid ${C.green}`, borderRadius:12, padding:"18px 20px" }}>
+                        <div style={{ fontSize:11, color:C.green, fontWeight:700, textTransform:"uppercase", letterSpacing:1.5 }}>
+                          ▲ {bestCase.label || "Optimistic Scenario"}
+                        </div>
+                        <div style={{ fontSize:22, fontWeight:800, color:C.green, marginTop:8 }}>
+                          ×{bestCase.multiplier?.toFixed(2)}
+                        </div>
+                        <div style={{ fontSize:13, color:C.muted2, marginTop:8, lineHeight:1.65 }}>{bestCase.description}</div>
+                      </div>
+                    )}
+                    {worstCase && (
+                      <div style={{ background:"rgba(239,68,68,0.07)", border:`1px solid ${C.red}`, borderRadius:12, padding:"18px 20px" }}>
+                        <div style={{ fontSize:11, color:C.red, fontWeight:700, textTransform:"uppercase", letterSpacing:1.5 }}>
+                          ▼ {worstCase.label || "Conservative Scenario"}
+                        </div>
+                        <div style={{ fontSize:22, fontWeight:800, color:C.red, marginTop:8 }}>
+                          ×{worstCase.multiplier?.toFixed(2)}
+                        </div>
+                        <div style={{ fontSize:13, color:C.muted2, marginTop:8, lineHeight:1.65 }}>{worstCase.description}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* DATA */}
+            {tab === "data" && (
+              <>
+                <SectionHeader title="Raw Data Explorer"
+                  subtitle={`${rows.length} rows × ${structure.columns?.length || 0} columns`} />
+                <DataTable rows={rows} columns={structure.columns || Object.keys(rows[0] || {})} />
+              </>
+            )}
+
+            {/* ASK */}
+            {tab === "ask" && (
+              <div style={{ maxWidth:760, margin:"0 auto" }}>
+                <SectionHeader title="Chat with your data"
+                  subtitle="Ask anything — Claude remembers context across the conversation" />
+                <div style={{
+                  background:C.panel, border:`1px solid ${C.border}`, borderRadius:12,
+                  padding:"20px", marginBottom:16, minHeight:200, maxHeight:500, overflowY:"auto"
+                }}>
+                  {chatHistory.length === 0 && (
+                    <div style={{ textAlign:"center", padding:"40px 20px" }}>
+                      <div style={{ fontSize:32, marginBottom:12 }}>💬</div>
+                      <div style={{ fontSize:14, color:C.muted, lineHeight:1.7 }}>
+                        Ask any question about your data.
+                      </div>
+                      <div style={{ display:"flex", gap:8, justifyContent:"center", marginTop:20, flexWrap:"wrap" }}>
+                        {["What are the top 5 items?","Are there any outliers?","What's the growth rate?","Summarize key trends"].map(q => (
+                          <button key={q} onClick={() => setQuestion(q)} style={{
+                            background:C.panel2, border:`1px solid ${C.border}`, color:C.muted2,
+                            borderRadius:8, padding:"7px 14px", cursor:"pointer", fontSize:12
+                          }}>{q}</button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {chatHistory.map((msg, i) => (
+                    <div key={i} style={{
+                      display:"flex", justifyContent: msg.role==="user" ? "flex-end" : "flex-start",
+                      marginBottom:16
+                    }}>
+                      <div style={{
+                        maxWidth:"80%",
+                        background: msg.role==="user" ? `linear-gradient(135deg, ${C.accent}, ${C.accent2})` : C.panel2,
+                        border: msg.role==="user" ? "none" : `1px solid ${C.border}`,
+                        borderRadius: msg.role==="user" ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
+                        padding:"12px 16px", fontSize:13,
+                        color: msg.role==="user" ? "#fff" : C.muted2, lineHeight:1.7
+                      }}>
+                        {msg.content.split("\n").map((line, j) => <div key={j}>{line || <br/>}</div>)}
+                      </div>
+                    </div>
+                  ))}
+                  {askLoading && (
+                    <div style={{ display:"flex", justifyContent:"flex-start", marginBottom:16 }}>
+                      <div style={{ background:C.panel2, border:`1px solid ${C.border}`, borderRadius:"14px 14px 14px 4px", padding:"12px 16px" }}>
+                        <Spinner text="Analyzing…" />
+                      </div>
+                    </div>
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+                <div style={{ display:"flex", gap:8 }}>
+                  <input value={question} onChange={e => setQuestion(e.target.value)}
+                    onKeyDown={e => e.key==="Enter" && !e.shiftKey && !askLoading && handleAsk()}
+                    placeholder="Ask a question about your data…"
+                    style={{
+                      flex:1, background:C.panel, border:`1px solid ${C.border}`,
+                      borderRadius:10, color:C.text, padding:"12px 16px", fontSize:14, outline:"none"
+                    }}
+                    onFocus={e => e.target.style.borderColor = C.accent}
+                    onBlur={e  => e.target.style.borderColor = C.border}
+                  />
+                  <button onClick={handleAsk} disabled={askLoading || !question.trim()} style={{
+                    background: askLoading || !question.trim()
+                      ? C.border
+                      : `linear-gradient(135deg, ${C.accent}, ${C.accent2})`,
+                    border:"none", borderRadius:10, color:"#fff", padding:"12px 22px",
+                    fontWeight:700, fontSize:14,
+                    cursor: askLoading || !question.trim() ? "default" : "pointer",
+                    transition:"all .2s", whiteSpace:"nowrap"
+                  }}>{askLoading ? "…" : "Ask →"}</button>
+                </div>
+                {chatHistory.length > 0 && (
+                  <button onClick={() => setChatHistory([])} style={{
+                    background:"transparent", border:"none", color:C.muted,
+                    cursor:"pointer", fontSize:12, marginTop:8, padding:0
+                  }}>Clear conversation</button>
+                )}
+              </div>
+            )}
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
